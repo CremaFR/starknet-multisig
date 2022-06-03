@@ -1,14 +1,20 @@
 import { expect } from "chai";
 import { assert } from "console";
-import { BigNumber } from "ethers";
+import { BigNumber, ethers } from "ethers";
 import { starknet } from "hardhat";
 import {
   StarknetContract,
   StarknetContractFactory,
   Account,
+  TransactionReceipt,
 } from "hardhat/types/runtime";
 import { number, stark } from "starknet";
 import { getSelectorFromName } from "starknet/dist/utils/hash";
+
+interface IEventDataEntry {
+  data: any;
+  isAddress?: boolean;
+}
 
 describe("Multisig with single signer", function () {
   this.timeout(300_000);
@@ -61,7 +67,6 @@ describe("Multisig with single signer", function () {
 
       const txIndex =
         Number((await multisig.call("get_transactions_len")).res) - 1;
-
       const res = await multisig.call("get_transaction", {
         tx_index: txIndex,
       });
@@ -392,6 +397,69 @@ describe("Multisig with single signer", function () {
       }
     });
   });
+
+  describe("- event emission - ", function () {
+    it("correct events are emitted for normal flow", async function () {
+      const payload = defaultPayload(targetContract.address, 6);
+      let txHash = await account.invoke(
+        multisig,
+        "submit_transaction",
+        payload
+      );
+      const receiptSubmit = await starknet.getTransactionReceipt(txHash);
+      const txIndex =
+        Number((await multisig.call("get_transactions_len")).res) - 1;
+
+      const eventDataSubmit: IEventDataEntry[] = [
+        { data: accountAddress, isAddress: true },
+        { data: ethers.utils.hexValue(txIndex) },
+        { data: targetContract.address, isAddress: true },
+      ];
+
+      txHash = await account.invoke(multisig, "confirm_transaction", {
+        tx_index: txIndex,
+      });
+      const receiptConfirm = await starknet.getTransactionReceipt(txHash);
+      const eventDataConfirm: IEventDataEntry[] = [
+        { data: accountAddress, isAddress: true },
+        { data: ethers.utils.hexValue(txIndex) },
+      ];
+
+      txHash = await account.invoke(multisig, "execute_transaction", {
+        tx_index: txIndex,
+      });
+      const receiptExecute = await starknet.getTransactionReceipt(txHash);
+      const eventDataExecute: IEventDataEntry[] = [
+        { data: accountAddress, isAddress: true },
+        { data: ethers.utils.hexValue(txIndex) },
+      ];
+
+      assertEvent(receiptSubmit, "SubmitTransaction", eventDataSubmit);
+      assertEvent(receiptConfirm, "ConfirmTransaction", eventDataConfirm);
+      assertEvent(receiptExecute, "ExecuteTransaction", eventDataExecute);
+    });
+    it("correct events are emitted for revoke", async function () {
+      const payload = defaultPayload(targetContract.address, 6);
+      await account.invoke(multisig, "submit_transaction", payload);
+      const txIndex =
+        Number((await multisig.call("get_transactions_len")).res) - 1;
+
+      await account.invoke(multisig, "confirm_transaction", {
+        tx_index: txIndex,
+      });
+      const txHash = await account.invoke(multisig, "revoke_confirmation", {
+        tx_index: txIndex,
+      });
+      const receipt = await starknet.getTransactionReceipt(txHash);
+
+      const eventData: IEventDataEntry[] = [
+        { data: accountAddress, isAddress: true },
+        { data: ethers.utils.hexValue(txIndex) },
+      ];
+
+      assertEvent(receipt, "RevokeConfirmation", eventData);
+    });
+  });
 });
 
 describe("Multisig with multiple signers", function () {
@@ -542,4 +610,30 @@ const assertErrorMsg = (full: string, expected: string) => {
     return;
   }
   expect.fail("No expected error found: " + expected);
+};
+
+const assertEvent = (
+  receipt: TransactionReceipt,
+  eventName: string,
+  eventData: IEventDataEntry[]
+) => {
+  const eventKey = getSelectorFromName(eventName);
+  const foundEvent = receipt.events.filter((e) =>
+    e.keys.some((a) => a == eventKey)
+  );
+  if (!foundEvent || foundEvent.length != 1 || foundEvent[0].keys.length != 1) {
+    expect.fail("No event " + eventName + " found");
+  }
+
+  expect(foundEvent[0].data.length).to.equal(eventData.length);
+  for (let i = 0; i < eventData.length; i++) {
+    if (eventData[i].isAddress) {
+      // Addresses in events are not padded to 32 bytes by default, for some reason
+      expect(ethers.utils.hexZeroPad(eventData[i].data, 32)).to.equal(
+        ethers.utils.hexZeroPad(foundEvent[0].data[i], 32)
+      );
+    } else {
+      expect(eventData[i].data).to.equal(foundEvent[0].data[i]);
+    }
+  }
 };
